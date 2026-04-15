@@ -26,6 +26,7 @@ class ActionType(Enum):
 class AgentState:
     """State tracking for agent decisions"""
     original_query: str
+    chat_history: List[Dict] = field(default_factory=list)
     refined_queries: List[str] = field(default_factory=list)
     iterations: int = 0
     retrieved_documents: List[Tuple[Document, float]] = field(default_factory=list)
@@ -181,32 +182,40 @@ class RAGAgent:
             state.retrieved_documents
         )
 
+    def _format_chat_history(self, chat_history: List[Dict]) -> str:
+        """Format chat history for inclusion in the prompt"""
+        if not chat_history:
+            return ""
+        lines = ["Previous conversation:"]
+        for turn in chat_history:
+            lines.append(f"Q: {turn['question']}")
+            lines.append(f"A: {turn['answer']}")
+        return "\n".join(lines) + "\n\n"
+
     def generate_answer(self, state: AgentState) -> str:
         """Generate final answer with citations"""
         if not state.retrieved_documents:
             return "No relevant documents found to answer your question."
-        
-        # Prepare context from top documents
+
         context = self._prepare_context(state.retrieved_documents)
-        
-        # Generate answer prompt
+        history_block = self._format_chat_history(state.chat_history)
+
         prompt = f"""You are a helpful AI assistant that answers questions based on provided documents.
+
+{history_block}Relevant Documents:
+{context}
 
 User Question: {state.original_query}
 
-Relevant Documents:
-{context}
-
-Please answer the question based on the provided documents. 
+Please answer the question based on the provided documents.
 Include specific references like [Source: document_name] for any claims.
 If information is not in the documents, say so."""
 
         state.reasoning_history.append("Generating answer from retrieved documents...")
         answer = self.llm.generate(prompt)
-        
-        # Extract citations from answer and documents
+
         state.citations = self._extract_citations(state.retrieved_documents)
-        
+
         return answer
 
     def _prepare_context(self, documents: List[Tuple[Document, float]]) -> str:
@@ -214,9 +223,9 @@ If information is not in the documents, say so."""
         context_parts = []
         for i, (doc, score) in enumerate(documents, 1):
             context_parts.append(
-                f"Document {i} [{doc.source}] (relevance: {score:.2f}):\n{doc.content[:500]}..."
+                f"Document {i} [{doc.source}] (relevance: {score:.2f}):\n{doc.content}"
             )
-        return "\n".join(context_parts)
+        return "\n\n".join(context_parts)
 
     def _extract_citations(self, documents: List[Tuple[Document, float]]) -> List[Dict]:
         """Extract citation information from documents"""
@@ -230,9 +239,9 @@ If information is not in the documents, say so."""
             })
         return citations
 
-    def run(self, query: str) -> Tuple[str, AgentState]:
+    def run(self, query: str, chat_history: Optional[List[Dict]] = None) -> Tuple[str, AgentState]:
         """Run the agent on a query"""
-        state = AgentState(original_query=query)
+        state = AgentState(original_query=query, chat_history=chat_history or [])
         
         while state.iterations < self.max_iterations:
             state.iterations += 1
@@ -263,14 +272,18 @@ If information is not in the documents, say so."""
         
         return state.final_answer, state
 
-    def run_with_streaming(self, query: str):
-        """Run the agent with streaming response"""
-        state = AgentState(original_query=query)
-        
+    def run_with_streaming(self, query: str, chat_history: Optional[List[Dict]] = None, state_ref: Optional[Dict] = None):
+        """Run the agent with streaming response.
+
+        Yields text chunks as they arrive. When finished, populates state_ref['state']
+        so the caller can access citations and reasoning after the generator is exhausted.
+        """
+        state = AgentState(original_query=query, chat_history=chat_history or [])
+
         while state.iterations < self.max_iterations:
             state.iterations += 1
             action = self.decide_action(state)
-            
+
             if action == ActionType.SEARCH:
                 search_query = query if state.iterations == 1 else self.refine_query(state)
                 state.retrieved_documents = self.search_documents(search_query, state)
@@ -281,21 +294,29 @@ If information is not in the documents, say so."""
                 self.rerank_documents(state)
             elif action == ActionType.GENERATE_ANSWER:
                 break
-        
-        # Generate context
+
         context = self._prepare_context(state.retrieved_documents) if state.retrieved_documents else ""
-        
+        history_block = self._format_chat_history(state.chat_history)
+
         prompt = f"""You are a helpful AI assistant that answers questions based on provided documents.
+
+{history_block}Relevant Documents:
+{context}
 
 User Question: {state.original_query}
 
-Relevant Documents:
-{context}
+Please answer the question based on the provided documents.
+Include specific references like [Source: document_name] for any claims.
+If information is not in the documents, say so."""
 
-Please answer the question based on the provided documents. Include citations."""
-
+        state.reasoning_history.append("Generating answer from retrieved documents...")
+        full_answer = ""
         for chunk in self.llm.generate_with_streaming(prompt):
+            full_answer += chunk
             yield chunk
-        
-        # Extract citations
+
+        state.final_answer = full_answer
         state.citations = self._extract_citations(state.retrieved_documents)
+
+        if state_ref is not None:
+            state_ref["state"] = state

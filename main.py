@@ -75,7 +75,7 @@ def load_documents_to_db(vector_db: VectorDatabase):
             st.error(f"Error loading documents: {str(e)}")
 
 
-def initialize_agent(vector_db: VectorDatabase) -> RAGAgent:
+def initialize_agent(vector_db: VectorDatabase, top_k: int, query_rewrite: bool, use_reranking: bool) -> RAGAgent:
     """Initialize the RAG agent"""
     try:
         agent = RAGAgent(
@@ -83,9 +83,9 @@ def initialize_agent(vector_db: VectorDatabase) -> RAGAgent:
             llm_provider=LLM_PROVIDER,
             llm_model=LLM_MODEL,
             max_iterations=MAX_ITERATIONS,
-            top_k=TOP_K,
-            use_query_rewriting=USE_QUERY_REWRITING,
-            use_reranking=USE_RE_RANKING
+            top_k=top_k,
+            use_query_rewriting=query_rewrite,
+            use_reranking=use_reranking
         )
         return agent
     except Exception as e:
@@ -93,20 +93,101 @@ def initialize_agent(vector_db: VectorDatabase) -> RAGAgent:
         return None
 
 
-def display_sources(citations):
-    """Display source citations"""
+@st.dialog("Document Preview", width="large")
+def preview_document_dialog():
+    chunk = st.session_state.get("preview_chunk")
+    if not chunk:
+        return
+
+    # Header row
+    col_title, col_close = st.columns([5, 1])
+    with col_title:
+        st.markdown(f"### {chunk['source']}")
+    with col_close:
+        if st.button("Close", use_container_width=True):
+            del st.session_state["preview_chunk"]
+            st.rerun()
+
+    # Metadata strip
+    meta_cols = st.columns(3)
+    meta_cols[0].metric("Relevance", f"{chunk['relevance']:.2%}")
+    meta_cols[1].metric("Chunk", f"{chunk['chunk_index'] + 1} / {chunk['total_chunks']}")
+    if chunk.get("metadata", {}).get("chunk_size"):
+        meta_cols[2].metric("Chunk size", f"{chunk['metadata']['chunk_size']} chars")
+
+    st.divider()
+
+    # Chunk content
+    st.markdown("**Retrieved passage:**")
+    ext = Path(chunk["source"]).suffix.lower()
+    if ext == ".md":
+        st.markdown(chunk["content"])
+    else:
+        st.text_area(
+            label="",
+            value=chunk["content"],
+            height=400,
+            disabled=True,
+            label_visibility="collapsed"
+        )
+
+    # Download original file if it still exists on disk
+    file_path = DOCUMENTS_DIR / chunk["source"]
+    if file_path.exists():
+        st.divider()
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        mime_map = {
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".txt": "text/plain",
+            ".md": "text/markdown",
+        }
+        mime = mime_map.get(ext, "application/octet-stream")
+        st.download_button(
+            label=f"Download {chunk['source']}",
+            data=file_bytes,
+            file_name=chunk["source"],
+            mime=mime,
+            use_container_width=True,
+        )
+
+
+def display_sources(citations, retrieved_documents=None):
+    """Display source citations with preview buttons"""
     if not citations:
         return
+
+    # Build lookup from chunk_id → Document for full content access
+    doc_lookup = {}
+    if retrieved_documents:
+        for doc, _ in retrieved_documents:
+            doc_lookup[doc.id] = doc
 
     st.divider()
     st.subheader("Sources")
 
     for i, citation in enumerate(citations, 1):
-        with st.expander(f"Source {i}: {citation['source']}"):
-            st.write(f"**Relevance Score:** {citation['relevance']:.2%}")
-            st.write(f"**Chunk ID:** {citation['chunk_id']}")
-            if citation['timestamp']:
-                st.write(f"**Timestamp:** {citation['timestamp']}")
+        col_info, col_btn = st.columns([5, 1])
+        with col_info:
+            st.markdown(
+                f"**{i}. {citation['source']}** &nbsp;·&nbsp; "
+                f"{citation['relevance']:.2%} relevance",
+                unsafe_allow_html=True
+            )
+        with col_btn:
+            doc = doc_lookup.get(citation["chunk_id"])
+            if doc is not None:
+                if st.button("Preview", key=f"preview_{i}_{citation['chunk_id']}"):
+                    st.session_state["preview_chunk"] = {
+                        "source": citation["source"],
+                        "relevance": citation["relevance"],
+                        "content": doc.content,
+                        "chunk_index": doc.chunk_index,
+                        "total_chunks": doc.total_chunks,
+                        "metadata": doc.metadata or {},
+                    }
+                    st.rerun()
 
 
 def display_reasoning(state):
@@ -151,6 +232,10 @@ def main():
 
     initialize_session_state()
 
+    # Trigger document preview dialog if a chunk was selected
+    if "preview_chunk" in st.session_state:
+        preview_document_dialog()
+
     st.title("Agentic RAG System")
     st.markdown("Ask questions about your documents with AI-powered reasoning, retrieval, and answer generation.")
 
@@ -164,6 +249,19 @@ def main():
         st.subheader("Agent Settings")
         query_rewrite = st.checkbox("Enable Query Rewriting", value=USE_QUERY_REWRITING)
         use_reranking = st.checkbox("Enable Re-ranking", value=USE_RE_RANKING)
+
+        # Re-init agent if settings changed
+        settings_changed = (
+            st.session_state.get("active_top_k") != top_k_display
+            or st.session_state.get("active_query_rewrite") != query_rewrite
+            or st.session_state.get("active_use_reranking") != use_reranking
+        )
+        if settings_changed and st.session_state.get("agent") is not None:
+            st.session_state.agent = None
+
+        st.session_state.active_top_k = top_k_display
+        st.session_state.active_query_rewrite = query_rewrite
+        st.session_state.active_use_reranking = use_reranking
 
         st.divider()
 
@@ -248,7 +346,12 @@ def main():
 
             # Initialize agent
             if st.session_state.agent is None:
-                st.session_state.agent = initialize_agent(st.session_state.vector_db)
+                st.session_state.agent = initialize_agent(
+                    st.session_state.vector_db,
+                    top_k=top_k_display,
+                    query_rewrite=query_rewrite,
+                    use_reranking=use_reranking
+                )
 
             if st.session_state.agent:
                 st.subheader("Ask Your Question")
@@ -260,31 +363,43 @@ def main():
 
                 if query:
                     if st.button("Search", use_container_width=True, type="primary"):
-                        with st.spinner("Thinking and retrieving..."):
-                            try:
-                                answer, state = st.session_state.agent.run(query)
+                        # Pass last 3 Q&A turns as memory context
+                        recent_history = st.session_state.chat_history[-3:]
+                        state_ref = {}
 
-                                st.session_state.chat_history.append({
-                                    "question": query,
-                                    "answer": answer,
-                                    "citations": state.citations
-                                })
+                        try:
+                            st.subheader("Answer")
+                            answer = st.write_stream(
+                                st.session_state.agent.run_with_streaming(
+                                    query,
+                                    chat_history=recent_history,
+                                    state_ref=state_ref
+                                )
+                            )
 
-                                st.subheader("Answer")
-                                st.markdown(answer)
+                            state = state_ref.get("state")
 
-                                display_sources(state.citations)
+                            st.session_state.chat_history.append({
+                                "question": query,
+                                "answer": answer,
+                                "citations": state.citations if state else []
+                            })
+
+                            if state:
+                                display_sources(state.citations, state.retrieved_documents)
                                 display_reasoning(state)
 
-                            except Exception as e:
-                                st.error(f"Error processing query: {str(e)}")
+                        except Exception as e:
+                            st.error(f"Error processing query: {str(e)}")
 
             if st.session_state.chat_history:
                 st.divider()
                 st.subheader("Chat History")
 
                 for i, chat in enumerate(reversed(st.session_state.chat_history)):
-                    with st.expander(f"Q: {chat['question'][:50]}..."):
+                    q = chat['question']
+                    label = f"Q: {q[:50]}{'...' if len(q) > 50 else ''}"
+                    with st.expander(label):
                         st.write(chat['answer'])
 
     with col2:
