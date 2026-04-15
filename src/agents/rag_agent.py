@@ -33,6 +33,8 @@ class AgentState:
     reasoning_history: List[str] = field(default_factory=list)
     final_answer: Optional[str] = None
     citations: List[Dict] = field(default_factory=list)
+    has_searched: bool = False
+    has_reranked: bool = False
 
 
 class QueryRewriter:
@@ -125,34 +127,31 @@ class RAGAgent:
 
     def decide_action(self, state: AgentState) -> ActionType:
         """Decide next action based on current state"""
-        # If we've hit max iterations, generate answer
         if state.iterations >= self.max_iterations:
             return ActionType.GENERATE_ANSWER
-        
-        # If we have no documents yet, search
+
+        # Always do the initial search first
+        if not state.has_searched:
+            return ActionType.SEARCH
+
+        # No results — try query rewriting then retry search
         if not state.retrieved_documents:
-            if state.iterations == 0:
-                return ActionType.SEARCH
-            elif self.use_query_rewriting and len(state.refined_queries) < 3:
+            if self.use_query_rewriting and len(state.refined_queries) < 3:
                 return ActionType.REFINE_QUERY
-            else:
-                return ActionType.SEARCH
-        
-        # If we have documents and haven't tried reranking, do it
-        if self.use_reranking and state.iterations == 1:
+            return ActionType.SEARCH
+
+        # Have results — rerank if enabled and not done yet
+        if self.use_reranking and not state.has_reranked:
             return ActionType.RERANK
-        
-        # Otherwise, generate answer
+
         return ActionType.GENERATE_ANSWER
 
     def search_documents(self, query: str, state: AgentState) -> List[Tuple[Document, float]]:
         """Search for relevant documents"""
         state.reasoning_history.append(f"Searching for: '{query}'")
-        
-        # Use hybrid search for better results
+        state.has_searched = True
+
         results = self.vector_db.hybrid_search(query, top_k=self.top_k)
-        
-        # Convert results to (Document, score) tuples
         return [(doc, score) for doc, score, _ in results]
 
     def refine_query(self, state: AgentState) -> str:
@@ -175,8 +174,9 @@ class RAGAgent:
         """Re-rank retrieved documents"""
         if not state.retrieved_documents:
             return
-        
+
         state.reasoning_history.append("Re-ranking documents...")
+        state.has_reranked = True
         state.retrieved_documents = self.document_ranker.rank_documents(
             state.original_query,
             state.retrieved_documents
@@ -218,13 +218,25 @@ If information is not in the documents, say so."""
 
         return answer
 
+    # Reserve ~2000 tokens for the question, history, and LLM response.
+    # 1 token ≈ 4 chars; 24 000 chars ≈ 6 000 tokens of context budget.
+    MAX_CONTEXT_CHARS = 24_000
+
     def _prepare_context(self, documents: List[Tuple[Document, float]]) -> str:
-        """Prepare context string from documents"""
+        """Prepare context string from documents, capped to MAX_CONTEXT_CHARS total."""
         context_parts = []
+        used = 0
+
         for i, (doc, score) in enumerate(documents, 1):
-            context_parts.append(
-                f"Document {i} [{doc.source}] (relevance: {score:.2f}):\n{doc.content}"
-            )
+            header = f"Document {i} [{doc.source}] (relevance: {score:.2f}):\n"
+            remaining = self.MAX_CONTEXT_CHARS - used - len(header) - 4  # 4 for "\n\n"
+            if remaining <= 0:
+                break
+            content = doc.content[:remaining]
+            part = header + content
+            context_parts.append(part)
+            used += len(part) + 4  # account for the "\n\n" separator
+
         return "\n\n".join(context_parts)
 
     def _extract_citations(self, documents: List[Tuple[Document, float]]) -> List[Dict]:
@@ -251,16 +263,21 @@ If information is not in the documents, say so."""
             
             # Execute action
             if action == ActionType.SEARCH:
-                search_query = query if state.iterations == 1 else self.refine_query(state)
-                state.retrieved_documents = self.search_documents(search_query, state)
-                
+                state.retrieved_documents = self.search_documents(query, state)
+
             elif action == ActionType.REFINE_QUERY:
-                if not state.refined_queries and self.use_query_rewriting:
-                    self.refine_query(state)
-                    
+                refined_query = self.refine_query(state)
+                results = self.search_documents(refined_query, state)
+                # Merge with existing results, deduplicating by chunk id
+                existing_ids = {doc.id for doc, _ in state.retrieved_documents}
+                for doc, score in results:
+                    if doc.id not in existing_ids:
+                        state.retrieved_documents.append((doc, score))
+                        existing_ids.add(doc.id)
+
             elif action == ActionType.RERANK:
                 self.rerank_documents(state)
-                
+
             elif action == ActionType.GENERATE_ANSWER:
                 answer = self.generate_answer(state)
                 state.final_answer = answer
@@ -285,13 +302,20 @@ If information is not in the documents, say so."""
             action = self.decide_action(state)
 
             if action == ActionType.SEARCH:
-                search_query = query if state.iterations == 1 else self.refine_query(state)
-                state.retrieved_documents = self.search_documents(search_query, state)
+                state.retrieved_documents = self.search_documents(query, state)
+
             elif action == ActionType.REFINE_QUERY:
-                if not state.refined_queries and self.use_query_rewriting:
-                    self.refine_query(state)
+                refined_query = self.refine_query(state)
+                results = self.search_documents(refined_query, state)
+                existing_ids = {doc.id for doc, _ in state.retrieved_documents}
+                for doc, score in results:
+                    if doc.id not in existing_ids:
+                        state.retrieved_documents.append((doc, score))
+                        existing_ids.add(doc.id)
+
             elif action == ActionType.RERANK:
                 self.rerank_documents(state)
+
             elif action == ActionType.GENERATE_ANSWER:
                 break
 

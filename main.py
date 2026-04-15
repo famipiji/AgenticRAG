@@ -66,9 +66,14 @@ def load_documents_to_db(vector_db: VectorDatabase):
             chunks = loader.process_documents(str(DOCUMENTS_DIR))
 
             if chunks:
-                vector_db.add_documents(chunks)
+                result = vector_db.add_documents(chunks)
                 loader.save_chunks(chunks, str(CHUNKS_DIR))
-                st.success(f"Loaded {len(chunks)} document chunks into vector database")
+                if result["added"]:
+                    st.success(f"Indexed {len(chunks)} chunks from: {', '.join(sorted(result['added']))}")
+                if result["skipped"]:
+                    st.info(f"Already indexed, skipped: {', '.join(sorted(result['skipped']))}")
+                if not result["added"] and not result["skipped"]:
+                    st.warning("No documents were processed")
             else:
                 st.warning("No documents were processed")
         except Exception as e:
@@ -106,7 +111,6 @@ def preview_document_dialog():
     with col_close:
         if st.button("Close", use_container_width=True):
             del st.session_state["preview_chunk"]
-            st.rerun()
 
     # Metadata strip
     meta_cols = st.columns(3)
@@ -187,7 +191,10 @@ def display_sources(citations, retrieved_documents=None):
                         "total_chunks": doc.total_chunks,
                         "metadata": doc.metadata or {},
                     }
-                    st.rerun()
+
+    # Open dialog in the same render pass — no rerun needed
+    if "preview_chunk" in st.session_state:
+        preview_document_dialog()
 
 
 def display_reasoning(state):
@@ -203,11 +210,6 @@ def display_reasoning(state):
 def handle_uploaded_files(uploaded_files):
     """Save uploaded files to documents dir and index them"""
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for uploaded_file in uploaded_files:
-        dest = DOCUMENTS_DIR / uploaded_file.name
-        dest.write_bytes(uploaded_file.getvalue())
-        saved.append(uploaded_file.name)
 
     if st.session_state.vector_db is None:
         st.session_state.vector_db = VectorDatabase(
@@ -215,7 +217,24 @@ def handle_uploaded_files(uploaded_files):
             vectordb_path=VECTORDB_PATH
         )
 
-    load_documents_to_db(st.session_state.vector_db)
+    indexed_sources = st.session_state.vector_db.get_indexed_sources()
+    saved = []
+    skipped = []
+
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name in indexed_sources:
+            skipped.append(uploaded_file.name)
+            continue
+        dest = DOCUMENTS_DIR / uploaded_file.name
+        dest.write_bytes(uploaded_file.getvalue())
+        saved.append(uploaded_file.name)
+
+    if skipped:
+        st.warning(f"Already indexed, skipped: {', '.join(skipped)}")
+
+    if saved:
+        load_documents_to_db(st.session_state.vector_db)
+
     st.session_state.agent = None
     st.session_state.db_loaded = True
     return saved
@@ -231,10 +250,6 @@ def main():
     )
 
     initialize_session_state()
-
-    # Trigger document preview dialog if a chunk was selected
-    if "preview_chunk" in st.session_state:
-        preview_document_dialog()
 
     st.title("Agentic RAG System")
     st.markdown("Ask questions about your documents with AI-powered reasoning, retrieval, and answer generation.")
@@ -361,9 +376,10 @@ def main():
                     placeholder="e.g., What are the key features of ASP.NET Core 8?"
                 )
 
+                searching = False
                 if query:
                     if st.button("Search", use_container_width=True, type="primary"):
-                        # Pass last 3 Q&A turns as memory context
+                        searching = True
                         recent_history = st.session_state.chat_history[-3:]
                         state_ref = {}
 
@@ -385,12 +401,34 @@ def main():
                                 "citations": state.citations if state else []
                             })
 
+                            # Persist result so it survives future reruns
+                            st.session_state.last_result = {
+                                "answer": answer,
+                                "citations": state.citations if state else [],
+                                "retrieved_documents": state.retrieved_documents if state else [],
+                                "reasoning": state.reasoning_history if state else [],
+                            }
+
+                            # Render sources on this render too so the user sees
+                            # them immediately after the answer streams
                             if state:
                                 display_sources(state.citations, state.retrieved_documents)
                                 display_reasoning(state)
 
                         except Exception as e:
                             st.error(f"Error processing query: {str(e)}")
+
+                # Render last result outside the Search block so it persists
+                # across reruns (e.g. when Preview button is clicked)
+                if not searching and "last_result" in st.session_state:
+                    result = st.session_state.last_result
+                    st.subheader("Answer")
+                    st.markdown(result["answer"])
+                    display_sources(result["citations"], result["retrieved_documents"])
+                    if result["reasoning"]:
+                        with st.expander("Agent Reasoning (Debug Info)"):
+                            for step in result["reasoning"]:
+                                st.write(f"-> {step}")
 
             if st.session_state.chat_history:
                 st.divider()

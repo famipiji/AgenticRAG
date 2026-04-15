@@ -73,35 +73,35 @@ class DocumentLoader:
 
     def chunk_text(self, text: str, source: str) -> List[Document]:
         """Split text into overlapping chunks"""
-        chunks = []
         text = text.strip()
-        
-        # Calculate number of chunks
-        step = self.chunk_size - self.chunk_overlap
-        num_chunks = (len(text) - self.chunk_size) // step + 1
-        
-        for i in range(num_chunks):
-            start_idx = i * step
+        if not text:
+            return []
+
+        step = max(1, self.chunk_size - self.chunk_overlap)
+        start_positions = list(range(0, len(text), step))
+        total_chunks = len(start_positions)
+        chunks = []
+
+        for i, start_idx in enumerate(start_positions):
             end_idx = min(start_idx + self.chunk_size, len(text))
-            chunk_text = text[start_idx:end_idx]
-            
-            # Create document chunk
-            chunk_id = f"{source}_{i}_{hashlib.md5(chunk_text.encode()).hexdigest()[:8]}"
+            chunk_content = text[start_idx:end_idx]
+
+            chunk_id = f"{source}_{i}_{hashlib.md5(chunk_content.encode()).hexdigest()[:8]}"
             doc = Document(
                 id=chunk_id,
-                content=chunk_text,
+                content=chunk_content,
                 source=source,
                 chunk_index=i,
-                total_chunks=num_chunks,
+                total_chunks=total_chunks,
                 metadata={
                     "timestamp": datetime.now().isoformat(),
-                    "chunk_size": len(chunk_text),
+                    "chunk_size": len(chunk_content),
                     "start_char": start_idx,
                     "end_char": end_idx
                 }
             )
             chunks.append(doc)
-        
+
         return chunks
 
     def process_documents(self, document_dir: str) -> List[Document]:

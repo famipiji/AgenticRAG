@@ -60,42 +60,51 @@ class VectorDatabase:
         self.documents = []
         self.doc_mapping = {}
 
-    def add_documents(self, documents: List[Document]) -> None:
-        """Add documents to the vector database"""
+    def get_indexed_sources(self) -> set:
+        """Return the set of source filenames already in the index"""
+        return {doc["source"] for doc in self.documents}
+
+    def add_documents(self, documents: List[Document]) -> Dict:
+        """Add documents to the vector database, skipping already-indexed sources.
+
+        Returns a dict with 'added' and 'skipped' source name sets.
+        """
         if not documents:
-            return
-        
-        # Extract text from documents
-        texts = [doc.content for doc in documents]
-        
-        # Generate embeddings
-        print(f"Generating embeddings for {len(texts)} documents...")
+            return {"added": set(), "skipped": set()}
+
+        indexed_sources = self.get_indexed_sources()
+        new_docs = [doc for doc in documents if doc.source not in indexed_sources]
+        skipped_sources = {doc.source for doc in documents if doc.source in indexed_sources}
+
+        if skipped_sources:
+            print(f"Skipping already-indexed sources: {skipped_sources}")
+
+        if not new_docs:
+            return {"added": set(), "skipped": skipped_sources}
+
+        texts = [doc.content for doc in new_docs]
+        print(f"Generating embeddings for {len(texts)} chunks...")
         embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
-        
-        # Ensure embeddings are float32 for FAISS
         embeddings = embeddings.astype(np.float32)
-        
-        # Get current size before adding
+
         start_idx = len(self.documents)
-        
-        # Add embeddings to FAISS index
         self.index.add(embeddings)
-        
-        # Store document references
-        for i, doc in enumerate(documents):
-            doc_dict = doc.to_dict() if hasattr(doc, 'to_dict') else {
-                'id': doc.id,
-                'content': doc.content,
-                'source': doc.source,
-                'chunk_index': doc.chunk_index,
-                'metadata': doc.metadata
+
+        for i, doc in enumerate(new_docs):
+            doc_dict = doc.to_dict() if hasattr(doc, "to_dict") else {
+                "id": doc.id,
+                "content": doc.content,
+                "source": doc.source,
+                "chunk_index": doc.chunk_index,
+                "metadata": doc.metadata
             }
             self.documents.append(doc_dict)
             self.doc_mapping[str(start_idx + i)] = doc.id
-        
-        # Save index to disk
+
         self._save_index()
-        print(f"Added {len(documents)} documents to vector database")
+        added_sources = {doc.source for doc in new_docs}
+        print(f"Added {len(new_docs)} chunks from {len(added_sources)} source(s)")
+        return {"added": added_sources, "skipped": skipped_sources}
 
     def search(
         self,
